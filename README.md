@@ -264,3 +264,311 @@ Breakdown:
 - `traefik.http.routers.whoami` → The router name is whoami
 - `.rule` → Defines the routing condition
 - `Host(whoami.local)` → Match when the HTTP Host header is exactly whoami.local
+
+Kubernetes
+
+```bash
+mode=generated var_cpu="2" var_ram="4096" var_disk="20" bash -c "$(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVE/main/ct/ubuntu.sh)"
+```
+
+```bash
+apt update
+apt install -y docker.io
+curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+
+k3d cluster create mycluster \
+  --k3s-arg "--kubelet-arg=feature-gates=KubeletInUserNamespace=true@server:*"
+```
+The KubeletInUserNamespace feature gate tells kubelet "it's okay if we can't access /dev/kmsg, just keep running"
+
+Install kubectl:
+```bash
+# Download the latest kubectl
+curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+
+# Make it executable
+chmod +x kubectl
+
+# Move it to your PATH
+sudo mv kubectl /usr/local/bin/
+
+# Verify it works
+kubectl version --client
+```
+
+```bash
+kubectl get nodes
+
+NAME                     STATUS   ROLES           AGE     VERSION
+k3d-mycluster-server-0   Ready    control-plane   3m23s   v1.35.5+k3s1
+```
+
+```bash
+# 1. Create deployment + service (one command!)
+kubectl create deploy whoami --image=traefik/whoami && kubectl expose deploy whoami --port=80
+
+deployment.apps/whoami created
+service/whoami exposed
+
+# 2. Port-forward (in background)
+kubectl port-forward svc/whoami 8080:80 &
+
+[1] 7412
+
+# 3. Test it
+curl localhost:8080
+
+curl localhost:8080
+Handling connection for 8080
+Hostname: whoami-5cbdff98fc-zqkt6
+IP: 127.0.0.1
+IP: ::1
+IP: 10.42.0.9
+IP: fe80::4cc7:6eff:fe94:1a91
+RemoteAddr: 127.0.0.1:49026
+GET / HTTP/1.1
+Host: localhost:8080
+User-Agent: curl/8.5.0
+Accept: */*
+```
+
+Traffic flow:
+
+`curl → localhost:8080 → DIRECT to whoami pod (skips Traefik entirely)`
+
+```bash
+kubectl port-forward -n kube-system service/traefik 8081:80 &
+
+kubectl run app1 --image=traefik/whoami --port=80 --expose
+kubectl run app2 --image=nginx --port=80 --expose
+kubectl run app3 --image=httpd --port=80 --expose
+
+service/app1 created
+pod/app1 created
+service/app2 created
+pod/app2 created
+service/app3 created
+pod/app3 created
+
+# Create 3 Ingress rules
+kubectl create ingress app1-ingress --rule="app1.local/*=app1:80"
+kubectl create ingress app2-ingress --rule="app2.local/*=app2:80"
+kubectl create ingress app3-ingress --rule="app3.local/*=app3:80"
+
+ingress.networking.k8s.io/app1-ingress created
+ingress.networking.k8s.io/app2-ingress created
+ingress.networking.k8s.io/app3-ingress created
+
+# ALL accessible through Traefik on the SAME port!
+curl -H "Host: app1.local" localhost:8081  # → whoami
+curl -H "Host: app2.local" localhost:8081  # → nginx
+curl -H "Host: app3.local" localhost:8081  # → httpd
+
+```
+Without Traefik, we'd need 3 different ports.
+
+```bash
+kubectl describe pod -n kube-system -l app.kubernetes.io/name=traefik | grep "Image:"
+    
+    Image: rancher/mirrored-library-traefik:3.6.13
+
+kubectl get deployment -n kube-system traefik -o yaml | grep -E "app.kubernetes.io/version|helm.sh/chart"
+    
+    helm.sh/chart: traefik-39.0.701_up39.0.7
+```
+
+### Traefik Static vs Dynamic Configuration (with k3d)
+
+Traefik has two types of configuration:
+
+- **Static Configuration** → how Traefik starts
+- **Dynamic Configuration** → what Traefik routes
+
+---
+
+#### 1. Static Configuration
+
+Static config is loaded when Traefik starts.
+
+Source:
+
+```text
+Helm values.yaml
+        |
+        v
+Kubernetes Deployment
+        |
+        v
+Traefik startup args
+```
+
+Example:
+```
+--entryPoints.web.address=:8000/tcp
+--entryPoints.websecure.address=:8443/tcp
+--providers.kubernetescrd
+```
+Defines:
+```
+entryPoints
+providers
+metrics
+dashboard/API
+```
+Example entryPoints:
+```
+web
+ :8000  --> HTTP
+
+websecure
+ :8443  --> HTTPS
+```
+
+#### 2. Dynamic Configuration
+
+Dynamic config is discovered while Traefik is running.
+
+Defines:
+```
+routers
+services
+middlewares
+TLS rules
+```
+
+Sources:
+
+Docker:
+```
+Container labels
+        |
+        v
+Docker provider
+        |
+        v
+Traefik routes
+```
+Kubernetes:
+```
+Ingress / IngressRoute
+        |
+        v
+Kubernetes API
+        |
+        v
+Traefik provider
+        |
+        v
+Traefik routes
+```
+Important:
+
+`Ingress` and `IngressRoute` are different:
+
+```
+Ingress
+   |
+   v
+--providers.kubernetesingress
+
+
+IngressRoute
+   |
+   v
+--providers.kubernetescrd
+```
+
+#### 3. Port-forward example
+
+Command:
+
+`kubectl port-forward -n kube-system service/traefik 8081:80`
+
+Flow:
+```
+localhost:8081
+        |
+        v
+Traefik Service :80
+        |
+        v
+targetPort
+        |
+        v
+Traefik container :8000
+        |
+        v
+web entryPoint
+```
+
+Remember:
+
+`Service port != container port`
+
+The Service hides the internal Traefik port.
+
+#### 4. Request flow
+
+Command:
+
+`curl -H "Host: app1.local" localhost:8081`
+
+Flow:
+```
+Request
+  |
+  v
+Traefik Service
+  |
+  v
+web entryPoint
+  |
+  v
+Router rule:
+Host(app1.local)
+  |
+  v
+Kubernetes Service
+  |
+  v
+Pod
+```
+
+### Final comparison
+Docker
+```
+Static:
+Traefik args
+
+
+Dynamic:
+Container labels
+
+Provider:
+Docker API
+```
+
+Kubernetes
+```
+Static:
+Helm values
+Traefik args
+
+Dynamic:
+Ingress / IngressRoute
+
+Provider:
+Kubernetes API
+```
+
+The concept is the same:
+```
+Static config = how Traefik runs
+
+Dynamic config = where traffic goes
+```
+
+Links:
+
+- https://mogenius.com/blog-post/deploying-traefik-with-helm-for-simplified-kubernetes-ingress
+- https://github.com/traefik/traefik-helm-chart/blob/v39.0.7/traefik/values.yaml
