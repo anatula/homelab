@@ -408,3 +408,567 @@ Links:
 
 - https://mogenius.com/blog-post/deploying-traefik-with-helm-for-simplified-kubernetes-ingress
 - https://github.com/traefik/traefik-helm-chart/blob/v39.0.7/traefik/values.yaml
+
+### NEW Tests scenarios
+
+Test all scenarios to see exactly how Traefik's `kubernetesIngress` provider behaves with different configurations.
+
+```bash
+# 1. Ingress with NO class (should work with Traefik)
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app3-no-class
+  namespace: default
+  annotations:
+    # No annotations at all
+spec:
+  # No ingressClassName specified
+  rules:
+  - host: app3-no-class.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: app3
+            port:
+              number: 80
+EOF
+
+# 2. Ingress with nginx class (should NOT work with Traefik)
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app3-nginx-class
+  namespace: default
+  annotations:
+    # No annotations, just the class
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: app3-nginx-class.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: app3
+            port:
+              number: 80
+EOF
+
+# 3. Ingress with NO class but NGINX annotations (should work? Let's test)
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app3-no-class-nginx-annos
+  namespace: default
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      add_header X-Test "no-class-nginx-anno";
+spec:
+  # No ingressClassName specified
+  rules:
+  - host: app3-no-class-nginx-annos.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: app3
+            port:
+              number: 80
+EOF
+
+# 4. Ingress with nginx class AND nginx annotations (should NOT work)
+cat <<EOF | kubectl apply -f -
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app3-nginx-class-annos
+  namespace: default
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      add_header X-Test "nginx-class-anno";
+spec:
+  ingressClassName: nginx
+  rules:
+  - host: app3-nginx-class-annos.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: app3
+            port:
+              number: 80
+EOF
+
+ingress.networking.k8s.io/app3-no-class created
+ingress.networking.k8s.io/app3-nginx-class created
+ingress.networking.k8s.io/app3-no-class-nginx-annos created
+ingress.networking.k8s.io/app3-nginx-class-annos created
+```
+
+From logs `kubectl logs -n traefik deployment/traefik --tail=5`
+
+```
+2026-07-07T09:05:42Z INF Creating in-cluster Provider client providerName=kubernetescrd
+2026-07-07T09:05:42Z INF Starting provider *traefik.Provider
+2026-07-07T09:15:43Z WRN A new release of Traefik has been found: 3.7.6. Please consider updating.
+2026-07-07T09:56:24Z INF Updated ingress status ingress=app3-no-class namespace=default
+2026-07-07T09:56:24Z INF Updated ingress status ingress=app3-no-class-nginx-annos namespace=default`
+```
+
+Traefik only processed/updated the status for:
+- app3-no-class
+- app3-no-class-nginx-annos
+
+It DID NOT process:
+
+- app3-nginx-class
+- app3-nginx-class-annos
+
+This confirms that Traefik's kubernetesIngress provider ONLY watches ingresses with:
+- No class specified (<none>) No Class = Works Regardless of Annotations 
+- ingressClassName: traefik
+
+### Test `kubernetesIngressNginx` provider:
+
+Docs: https://doc.traefik.io/traefik/reference/install-configuration/providers/kubernetes/kubernetes-ingress-nginx/
+
+The kubernetesIngressNGINX provider:
+
+✅ Reads NGINX-style Ingress resources (with ingressClassName: nginx)
+✅ Translates NGINX annotations to Traefik routes
+
+```bash
+cat traefik-new-values.yaml
+# Keep your existing settings
+api:
+  dashboard: false
+
+ports:
+  web:
+    port: 80
+
+# Add both providers (kubernetesIngress is enabled by default, but let's be explicit)
+providers:
+  kubernetesIngress:
+    enabled: true
+  kubernetesIngressNGINX:
+    enabled: true
+    watchNamespace: "default"
+    ingressClass: "nginx"
+    controllerClass: "k8s.io/ingress-nginx"
+    watchIngressWithoutClass: false
+    ingressClassByName: false
+
+```
+
+```bash
+helm upgrade traefik traefik/traefik -f traefik-new-values.yaml -n traefik
+
+Release "traefik" has been upgraded. Happy Helming!
+NAME: traefik
+LAST DEPLOYED: Tue Jul  7 12:47:38 2026
+NAMESPACE: traefik
+STATUS: deployed
+REVISION: 2
+DESCRIPTION: Upgrade complete
+TEST SUITE: None
+NOTES:
+traefik with docker.io/traefik:v3.7.5 has been deployed successfully on traefik namespace!
+```
+
+In the docs in helm values it says `kubernetesIngressNginx` but
+```bash
+Error: UPGRADE FAILED: values don't meet the specifications of the schema(s) in the following chart(s):
+traefik:
+- at '/providers': additional properties 'kubernetesIngressNginx' not allowed
+```
+so it's `kubernetesIngressNGINX`. And:
+```yaml
+namespaces:
+      - default`
+```
+```
+Error: UPGRADE FAILED: values don't meet the specifications of the schema(s) in the following chart(s):
+traefik:
+- at '/providers/kubernetesIngressNGINX': additional properties 'namespaces' not allowed
+```
+it is:
+```yaml
+watchNamespace: "default"
+```
+
+`kubectl logs -n traefik deployment/traefik`
+
+```bash
+2026-07-07T10:56:24Z INF Creating in-cluster Provider client
+2026-07-07T10:56:24Z INF Starting provider aggregator *aggregator.ProviderAggregator
+2026-07-07T10:56:24Z INF Starting provider *traefik.Provider
+2026-07-07T10:56:24Z INF Starting provider *ingressnginx.Provider
+2026-07-07T10:56:24Z INF Starting provider *ingress.Provider
+2026-07-07T10:56:24Z INF ingress label selector is: "" providerName=kubernetes
+2026-07-07T10:56:24Z INF Creating in-cluster Provider client providerName=kubernetes
+2026-07-07T10:56:24Z INF Starting provider *crd.Provider
+2026-07-07T10:56:24Z INF label selector is: "" providerName=kubernetescrd
+2026-07-07T10:56:24Z INF Creating in-cluster Provider client providerName=kubernetescrd
+2026-07-07T10:56:24Z INF Starting provider *acme.ChallengeTLSALPN
+2026-07-07T10:56:24Z ERR Invalid Ingress, skipping error="snippet annotations are not allowed when allowSnippetAnnotations is disabled" ingress=app3-nginx-class-annos namespace=default providerName=kubernetesingressnginx
+```
+
+#### Annotations
+
+The problematic annotation is: `nginx.ingress.kubernetes.io/configuration-snippet`
+The other annotations (`proxy-body-size` and `rewrite-target`) are not blocked. The error is only about `configuration-snippet`.
+
+
+For now, just remove them. Option 1
+```bash
+# Remove only the configuration-snippet annotation
+kubectl annotate ingress app3-nginx-class-annos nginx.ingress.kubernetes.io/configuration-snippet- --overwrite
+
+# Now the ingress should work
+curl -v -H "Host: app3-nginx-class-annos.local" localhost
+```
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Traefik (172.18.0.2)                     │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  kubernetesIngress Provider        kubernetesIngressNginx   │
+│  ─────────────────────────        ──────────────────────    │
+│  ✅ app1-ingress (traefik class)  ✅ app3-nginx-class       │
+│  ✅ app2-ingress (traefik class)  ✅ app3-nginx-class-annos │
+│  ✅ app3-ingress (traefik class)                            │
+│  ✅ app3-no-class                                           │
+│  ✅ app3-no-class-nginx-annos                               │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+The NGINX class ingresses (app3-nginx-class and app3-nginx-class-annos) still have no ADDRESS even though they work. This is because the NGINX provider needs a publishService configuration to know which service's IP to use for the status.
+
+```bash
+k get ingress -A
+NAMESPACE   NAME                        CLASS     HOSTS                             ADDRESS      PORTS   AGE
+default     app1-ingress                traefik   app1.local                        172.18.0.2   80      5d13h
+default     app2-ingress                traefik   app2.local                        172.18.0.2   80      5d13h
+default     app3-ingress                traefik   app3.local                        172.18.0.2   80      5d13h
+default     app3-nginx-class            nginx     app3-nginx-class.local                         80      92m
+default     app3-nginx-class-annos      nginx     app3-nginx-class-annos.local                   80      92m
+default     app3-no-class               traefik   app3-no-class.local               172.18.0.2   80      92m
+default     app3-no-class-nginx-annos   traefik   app3-no-class-nginx-annos.local   172.18.0.2   80      92m
+```
+
+The NGINX provider doesn't automatically know which LoadBalancer IP to publish. It needs to be told explicitly which service to use for the status address. The Fix: Set publishService. But as doc says:
+
+https://doc.traefik.io/traefik/migrate/nginx-to-traefik/#step-1-install-traefik-alongside-nginx
+
+```
+Running both controllers against the same Ingresses creates contention on the status.loadBalancer.ingress[] field. Before installing, review the Ingress Status Race Condition section in Step 3 and decide which mitigation to apply (disable publishService on Traefik, or use a transitional IngressClass).
+```
+
+Why This Happens
+Both providers are watching and reconciling the same Ingress resources. When they do, they both try to write the IP address of their respective LoadBalancer service into the status field. They constantly overwrite each other, leading to a flapping status.
+
+Crucially, this does not affect routing. Your curl commands work perfectly because the routing is handled internally by Traefik, independent of the status field.
+
+
+Read more https://doc.traefik.io/traefik/migrate/nginx-to-traefik/#status-race
+
+
+The NGINX Controller is no longer needed because:
+
+- Traefik reads ingressClassName: nginx ingresses
+- Traefik translates NGINX annotations
+- Your apps work exactly as before
+
+### Moving to Gateway API
+
+Gateway API is the next-generation Kubernetes Ingress API, offering:
+
+- More expressive routing (HTTP header matching, weight-based traffic splitting)
+- Role-based access control (different teams can manage different parts)
+- Better separation of concerns (infrastructure vs application owners)
+- Cross-namespace routing (secure and flexible)
+
+Traefik supports all three approaches simultaneously, so you can migrate gradually:
+
+```yaml
+# Traefik can run ALL providers at the same time:
+providers:
+  # Current providers (keep these running)
+  kubernetesIngress:
+    enabled: true
+  
+  kubernetesIngressNGINX:
+    enabled: true
+  
+  # Future Gateway API provider
+  kubernetesGateway:
+    enabled: true  # ← Add this when ready
+```
+
+#### Step 1: Install Gateway API CRDs (if not already present)
+
+```bash
+# Install the Gateway API CRDs
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.2.0/standard-install.yaml
+```
+
+#### Step 2: Enable Gateway Provider in Traefik
+```bash
+# Update Traefik configuration
+cat <<EOF > traefik-with-gateway.yaml
+api:
+  dashboard: false
+
+ports:
+  web:
+    port: 80
+  gateway:
+    port: 8000
+    exposedPort: 8000
+    protocol: TCP
+
+providers:
+  kubernetesIngress:
+    enabled: true
+  kubernetesIngressNGINX:
+    enabled: true
+  kubernetesGateway:
+    enabled: true
+EOF
+
+helm upgrade traefik traefik/traefik -f traefik-with-gateway.yaml -n traefik
+```
+
+Error:
+
+```bash
+helm upgrade traefik traefik/traefik -f traefik-with-gateway.yaml -n traefik
+
+Error: UPGRADE FAILED: execution error at (traefik/templates/gateway.yaml:39:12): ERROR: port 8000 is not declared in ports
+```
+Fix: add port gateway on port 8000
+
+A warning is given after `helm apply`:
+
+```bash
+Release "traefik" has been upgraded. Happy Helming!
+NAME: traefik
+LAST DEPLOYED: Wed Jul  8 10:39:26 2026
+NAMESPACE: traefik
+STATUS: deployed
+REVISION: 3
+DESCRIPTION: Upgrade complete
+TEST SUITE: None
+NOTES:
+traefik with docker.io/traefik:v3.7.5 has been deployed successfully on traefik namespace!
+
+⚠️ DEPRECATION WARNING: Gateway API CRDs will no longer be shipped with this chart in a future major version.
+You will need to install them yourself before deploying Traefik v3.7:
+  kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
+```
+
+More errors, fix by:
+```bash
+helm upgrade traefik traefik/traefik -f traefik-with-gateway.yaml -n traefik
+
+Release "traefik" has been upgraded. Happy Helming!
+NAME: traefik
+LAST DEPLOYED: Wed Jul  8 10:53:26 2026
+NAMESPACE: traefik
+STATUS: deployed
+REVISION: 4
+DESCRIPTION: Upgrade complete
+TEST SUITE: None
+NOTES:
+traefik with docker.io/traefik:v3.7.5 has been deployed successfully on traefik namespace!
+
+⚠️ DEPRECATION WARNING: Gateway API CRDs will no longer be shipped with this chart in a future major version.
+You will need to install them yourself before deploying Traefik v3.7:
+  kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/standard-install.yaml
+
+
+cat traefik-with-gateway.yaml
+api:
+  dashboard: false
+
+ports:
+  web:
+    port: 80
+  gateway:
+    port: 8000
+    exposedPort: 8000
+    protocol: TCP
+
+providers:
+  kubernetesIngress:
+    enabled: true
+  kubernetesIngressNGINX:
+    enabled: true
+  kubernetesGateway:
+    enabled: true
+    experimentalChannel: false
+```
+
+In the traefik logs:
+
+```
+E0708 08:54:11.348865       1 reflector.go:204] "Failed to watch" err="failed to list *v1.TLSRoute: the server could not find the requested resource (get tlsroutes.gateway.networking.k8s.io)" logger="UnhandledError" reflector="k8s.io/client-go@v0.35.2/tools/cache/reflector.go:289" type="*v1.TLSRoute"
+E0708 08:54:25.031079       1 reflector.go:204] "Failed to watch" err="failed to list *v1.BackendTLSPolicy: the server could not find the requested resource (get backendtlspolicies.gateway.networking.k8s.io)" logger="UnhandledError" reflector="k8s.io/client-go@v0.35.2/tools/cache/reflector.go:289" type="*v1.BackendTLSPolicy"
+E0708 08:55:03.400242       1 reflector.go:204] "Failed to watch" err="failed to list *v1.BackendTLSPolicy: the server could not find the requested resource (get backendtlspolicies.gateway.networking.k8s.io)" logger="UnhandledError" reflector="k8s.io/client-go@v0.35.2/tools/cache/reflector.go:289" type="*v1.BackendTLSPolicy"
+E0708 08:55:08.449929       1 reflector.go:204] "Failed to watch" err="failed to list *v1.TLSRoute: the server could not find the requested resource (get tlsroutes.gateway.networking.k8s.io)" logger="UnhandledError" reflector="k8s.io/client-go@v0.35.2/tools/cache/reflector.go:289" type="*v1.TLSRoute"
+```
+
+Install experimental CRDs test:
+
+```bash
+# Install experimental Gateway API CRDs
+kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.5.1/experimental-install.yaml
+
+# Check if errors stop
+kubectl logs -n traefik deployment/traefik --tail=20 -f
+```
+
+#### Step 3: Create GatewayClass and Gateway
+
+```bash
+# Create a GatewayClass (like an IngressClass for Gateway API)
+cat <<EOF | kubectl apply -f -
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: traefik
+spec:
+  controllerName: traefik.io/gateway-controller
+---
+# Create a Gateway (like a LoadBalancer service)
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: traefik-gateway
+  namespace: default
+spec:
+  gatewayClassName: traefik
+  listeners:
+  - name: http
+    protocol: HTTP
+    port: 80
+    allowedRoutes:
+      namespaces:
+        from: All
+EOF
+```
+
+#### Step 4: Create Gateway API Routes (Gradual Migration)
+
+Create Gateway API resources while keeping your existing ingresses:
+
+```yaml
+# Example: Migrate app1 from Ingress to Gateway API
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: app1-route
+  namespace: default
+spec:
+  parentRefs:
+  - name: traefik-gateway
+    namespace: default
+  hostnames:
+  - "app1.local"
+  rules:
+  - matches:
+    - path:
+        type: PathPrefix
+        value: /
+    backendRefs:
+    - name: app1
+      port: 80
+```
+
+```bash
+# Test app1.local - should work exactly as before
+curl -H "Host: app1.local" localhost
+
+# Check Traefik logs to confirm it's using the Gateway route
+kubectl logs -n traefik deployment/traefik --tail=50 | grep -i "app1"
+```
+
+Delete the Old Ingress
+Once you've confirmed the HTTPRoute works, then delete the Ingress:
+
+```bash
+# Delete the old Ingress for app1
+kubectl delete ingress app1-ingress
+
+
+# Verify app1.local still works
+curl -H "Host: app1.local" localhost
+```
+
+Result:
+```bash
+k get ingress -A
+NAMESPACE   NAME                        CLASS     HOSTS                             ADDRESS      PORTS   AGE
+default     app2-ingress                traefik   app2.local                        172.18.0.2   80      6d11h
+default     app3-ingress                traefik   app3.local                        172.18.0.2   80      6d11h
+default     app3-nginx-class            nginx     app3-nginx-class.local                         80      23h
+default     app3-nginx-class-annos      nginx     app3-nginx-class-annos.local                   80      23h
+default     app3-no-class               traefik   app3-no-class.local               172.18.0.2   80      23h
+default     app3-no-class-nginx-annos   traefik   app3-no-class-nginx-annos.local   172.18.0.2   80      23h
+
+
+k get httproute -A
+NAMESPACE   NAME         HOSTNAMES        AGE
+default     app1-route   ["app1.local"]   103s
+
+
+curl -H "Host: app1.local" localhost
+Hostname: app1
+IP: 127.0.0.1
+IP: ::1
+IP: 10.42.0.25
+IP: fe80::ec43:e0ff:fe02:c4a8
+RemoteAddr: 10.42.0.30:47840
+GET / HTTP/1.1
+Host: app1.local
+User-Agent: curl/8.5.0
+Accept: */*
+Accept-Encoding: gzip
+X-Forwarded-For: 10.42.0.1
+X-Forwarded-Host: app1.local
+X-Forwarded-Port: 80
+X-Forwarded-Proto: http
+X-Forwarded-Server: traefik-8497f8876f-f99x2
+X-Real-Ip: 10.42.0.1
+```
+
+Traefik is handling both:
+
+- Traditional Ingress resources (app2.local, app3.local)
+- Gateway API HTTPRoute (app1.local)
+
+Both are being routed through the same Traefik instance.
+
+## Important: 
+
+`Create HTTPRoute FIRST → Test it → Then delete Ingress`
